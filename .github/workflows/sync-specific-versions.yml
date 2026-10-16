@@ -1,0 +1,81 @@
+name: Sync Specific Major Versions
+
+# 从来源仓库 rnamoy/chrome_installer 把指定主版本的「最大号 Release」同步到本仓库。
+#
+# 用本仓库的 mirror_releases.py 实现：通过公开的 asset 下载直链取文件，
+# 不需要来源仓库的任何凭证，只需要本仓库的 contents: write 权限。
+#
+# 用法：Run workflow 时在 spec 里填主版本，例如 129,139,149（也支持空格/换行分隔）。
+# 不填 = 什么都不做（不会全量同步），避免误触发把几十个主版本一次性拉下来。
+# 想同步全部缺失/不完整的主版本，显式填 all。
+on:
+  # 这个 push 触发的唯一目的是「注册」工作流：
+  # 新增的 workflow_dispatch 工作流需要被实际触发过一次才会出现在 Actions 列表里。
+  # 这里限制为只有本文件自身变更时才触发，且 push 时 spec 固定为 none
+  # （只做 dry-run，不传输任何数据）。
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/sync-specific-versions.yml'
+  workflow_dispatch:
+    inputs:
+      spec:
+        description: '要同步的主版本，如 129,139,149；留空=什么都不做；填 all=全部缺失/不完整的主版本'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  # 第一步：算出需要同步哪些 tag
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tags: ${{ steps.resolve.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve tags
+        id: resolve
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          # 留空或 push 触发时用 none 兜底：只做 dry-run，不同步任何东西
+          SPEC: ${{ inputs.spec || 'none' }}
+        run: |
+          set -euo pipefail
+          python -B mirror_releases.py --dry-run | tee resolve.log
+          tags=$(grep -m1 '^resolved tags' resolve.log | sed -E "s/^[^[]*//; s/'/\"/g")
+          [ -n "$tags" ] || tags='[]'
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "resolved: $tags"
+
+  # 第二步：每个 tag 一个 job 并行同步；已完整的资产会自动跳过，可安全重跑
+  sync:
+    needs: resolve
+    if: needs.resolve.outputs.tags != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        tag: ${{ fromJson(needs.resolve.outputs.tags) }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Sync ${{ matrix.tag }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SPEC: ${{ matrix.tag }}
+        run: python -B mirror_releases.py --spec "${{ matrix.tag }}"
+
+  # 没有需要同步的内容时明确提示，避免看起来像失败
+  nothing-to-do:
+    needs: resolve
+    if: needs.resolve.outputs.tags == '[]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Nothing to sync
+        run: 'echo "Nothing to sync: no major version requested, or everything is already complete."'
