@@ -1,0 +1,122 @@
+name: Check Update and Upload Releases
+
+on:
+  push: 
+    branches: main
+  workflow_dispatch:
+    inputs:
+      delete_majors:
+        description: '【手动删除】要整组删除的主版本，如 120,121；填 all 删除全部；留空=不删除'
+        required: false
+        default: ''
+  schedule:
+    # 每天 17:00 UTC（北京时间次日 01:00）检查一次更新
+    - cron: '17 17 * * *'
+
+concurrency:
+  # 串行执行，避免定时任务与 push 触发的运行互相覆盖 main / 重复打 tag
+  group: check-update
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+
+    - name: Check Update
+      run: python fetch.py
+
+    - name: Download Latest Stable Releases
+      # 只发布 64 位架构
+      run: python download.py --arch win_stable_x64
+
+    - name: Check for EXE Files
+      id: check_files
+      run: |
+        if find . -name "*.exe" -print -quit | grep -q .; then
+          echo "exe_exists=true" >> $GITHUB_ENV
+        else
+          echo "exe_exists=false" >> $GITHUB_ENV
+        fi
+
+    - name: Check if Tag Exists
+      id: check_tag
+      run: |
+        if git rev-parse "refs/tags/${{ env.latest_version }}" >/dev/null 2>&1; then
+          echo "tag_exists=true" >> $GITHUB_ENV
+        else
+          echo "tag_exists=false" >> $GITHUB_ENV
+        fi
+
+    - name: Commit Files
+      env:
+        TZ: America/New_York
+      run: |
+        git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+        git add .
+        git commit -m ":pencil: Auto update Chrome at $(date +'%Y-%m-%d %H:%M')" -a || echo "No changes to commit"
+
+    - name: Push Changes
+      run: |
+        git push origin main
+
+    # 自动归档：每个主版本只保留版本号最大的那个 Release。
+    - name: Archive Releases (Keep One Per Major)
+      # 仅在「要发布新版本」时运行，避免每次提交都调用 API
+      if: env.exe_exists == 'true' && env.tag_exists == 'false'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        python -B archive_releases.py
+
+    # 手动删除入口：整组删除指定主版本，用于精简发布区。
+    # 只有手动触发并填写 delete_majors 时才运行；不需要下载/检查更新。
+    - name: Delete Releases By Major (manual)
+      if: inputs.delete_majors != ''
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        echo "DELETE_MAJORS='${{ inputs.delete_majors }}'"
+        python -B archive_releases.py --delete-majors "${{ inputs.delete_majors }}"
+
+    - name: Create Tag
+      if: env.exe_exists == 'true' && env.tag_exists == 'false'
+      run: |
+        git tag ${{ env.latest_version }}
+        git push origin ${{ env.latest_version }}
+
+    - name: Upload Release
+      if: env.exe_exists == 'true' && env.tag_exists == 'false'
+      uses: softprops/action-gh-release@v3
+      with:
+        tag_name: ${{ env.latest_version }}
+        files: '*.exe'
+
+    # 验证发布结果：草稿只有有写权限的人可见，公开存档必须确认是已发布状态。
+    # 输出形如：check 155.0.8059.40: published  assets=1
+    # 若为 DRAFT 则退出码非零，便于一眼发现。
+    - name: Verify Release Is Published
+      if: env.exe_exists == 'true' && env.tag_exists == 'false'
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        python -B archive_releases.py --repo "$GITHUB_REPOSITORY" \
+          --check-release "${{ env.latest_version }}"
+
+    - name: Reset Main Branch
+      if: env.exe_exists == 'true' && env.tag_exists == 'false'
+      run: |
+        git checkout --orphan temp_branch
+        git add -A
+        git commit -m "Init"
+        git push --force origin temp_branch:main
